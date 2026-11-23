@@ -13,7 +13,7 @@ Plug a PS5 (or any console) into a USB capture card and Smooth60 turns 30 fps ga
 
 - **Frame generation** — creates a new frame between every pair of real ones with Apple's low-latency frame interpolation (VideoToolbox), so a 30 fps game plays at **60 fps** (2×) or **120 fps** (4×). It pauses automatically when the game already runs above ~40 fps.
 - **Upscaling** — MetalFX, Apple's real-time game upscaler, takes 1080p up to **1440p or 4K** (60 fps mode).
-- **Enhancement** — Light / Medium / Strong: sharpening and colour, plus Apple's temporal noise filter to clean up capture noise and shimmer. Optional **HUD & subtitle protection** keeps corners and subtitles untouched.
+- **Enhancement** — Light / Medium / Strong: sharpening and colour, plus Apple's temporal noise filter to clean up capture noise and shimmer. Optional **HUD & subtitle protection** keeps corners and subtitles untouched — in **Auto** mode it finds the captions on screen and grows the protected strip to fit two-line and large subtitles. **Show protected areas** outlines exactly what's left alone.
 - **Sound in sync** — plays the capture card's game audio delayed by exactly the same amount as the picture.
 - **Record & screenshot** — MP4 recordings and PNG screenshots of the processed picture (F8 / F7).
 - **Stream output window** — a clean, video-only window for Window Capture in Streamlabs or OBS.

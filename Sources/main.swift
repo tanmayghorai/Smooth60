@@ -389,12 +389,25 @@ enum EnhanceLevel: Int {
     var contrast: Double { [1, 1.02, 1.035, 1.05][rawValue] }
 }
 
+/// How tall the protected subtitle strip at the bottom is.
+enum SubtitleMode: Int {
+    case auto = 0, normal, large, largest
+    var title: String { ["Auto (finds captions)", "Normal (13%)", "Large (18%)", "Largest (24%)"][rawValue] }
+    var fixedHeight: CGFloat { [0.13, 0.13, 0.18, 0.24][rawValue] }
+}
+
 final class Enhancer {
     let width: Int
     let height: Int
     let format: OSType
     let level: EnhanceLevel
     let protectHUD: Bool
+    let subtitleMode: SubtitleMode
+    /// The subtitle strip as fractions of the frame: top (from the bottom edge), left, right.
+    private(set) var band = (top: CGFloat(0.13), left: CGFloat(0.2), right: CGFloat(0.8))
+    private var bandHold = 0                       // frames to keep a grown strip before shrinking it
+    private var detectCounter = 0
+    private var masks: [String: CVPixelBuffer] = [:]
     var denoiseAllowed = true              // set false if the Mac can't keep up
     private(set) var denoiseFailed: String?
     private(set) var lastError: String?
@@ -426,12 +439,14 @@ final class Enhancer {
         return pool
     }
 
-    init(width: Int, height: Int, format: OSType, level: EnhanceLevel, protectHUD: Bool) {
+    init(width: Int, height: Int, format: OSType, level: EnhanceLevel, protectHUD: Bool, subtitleMode: SubtitleMode = .auto) {
         self.width = width
         self.height = height
         self.format = format
         self.level = level
         self.protectHUD = protectHUD
+        self.subtitleMode = subtitleMode
+        band = (subtitleMode.fixedHeight, 0.2, 0.8)
         if let device = MTLCreateSystemDefaultDevice() {
             context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false, .name: "Smooth60 enhance",
                                                              .workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
@@ -532,23 +547,98 @@ final class Enhancer {
 
     /// Screen areas left untouched when HUD protection is on: the four corners
     /// (health, money, minimap, prompts) and the subtitle band at the bottom.
-    private func hudRects() -> [CGRect] {
-        let w = CGFloat(width), h = CGFloat(height)
-        let cw = (w * 0.24).rounded(), ch = (h * 0.20).rounded()
-        return [
-            CGRect(x: 0, y: 0, width: cw, height: ch),
-            CGRect(x: w - cw, y: 0, width: cw, height: ch),
-            CGRect(x: 0, y: h - ch, width: cw, height: ch),
-            CGRect(x: w - cw, y: h - ch, width: cw, height: ch),
-            CGRect(x: (w * 0.2).rounded(), y: 0, width: (w * 0.6).rounded(), height: (h * 0.13).rounded()),
+    /// Protected areas as fractions of the frame (origin bottom-left): four corners + the subtitle strip.
+    var protectedRects: [CGRect] {
+        [
+            CGRect(x: 0, y: 0, width: 0.24, height: 0.20),
+            CGRect(x: 0.76, y: 0, width: 0.24, height: 0.20),
+            CGRect(x: 0, y: 0.80, width: 0.24, height: 0.20),
+            CGRect(x: 0.76, y: 0.80, width: 0.24, height: 0.20),
+            CGRect(x: band.left, y: 0, width: band.right - band.left, height: band.top),
         ]
     }
 
-    private var maskBuffer: CVPixelBuffer?
+    private func hudRects() -> [CGRect] {
+        let w = CGFloat(width), h = CGFloat(height)
+        return protectedRects.map { CGRect(x: ($0.minX * w).rounded(), y: ($0.minY * h).rounded(),
+                                           width: ($0.width * w).rounded(), height: ($0.height * h).rounded()) }
+    }
 
-    /// White = protected (keep the original), black = enhance. Rendered once, with soft edges.
+    /// Finds on-screen captions near the bottom: rows with many sharp bright-to-dark edges (white text
+    /// with a dark outline or shadow), stacked upwards from the subtitle area. Returns how far up they
+    /// reach and how wide they are, as fractions, or nil when there's no caption.
+    private func findCaptions(in frame: CVPixelBuffer) -> (top: CGFloat, left: CGFloat, right: CGFloat)? {
+        guard CVPixelBufferGetPlaneCount(frame) >= 1 else { return nil }
+        CVPixelBufferLockBaseAddress(frame, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(frame, 0) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(frame, 0)
+        let w = CVPixelBufferGetWidthOfPlane(frame, 0), h = CVPixelBufferGetHeightOfPlane(frame, 0)
+        let luma = base.assumingMemoryBound(to: UInt8.self)
+        let step = max(2, w / 480)                  // ~4 px at 1080p
+        let rowStep = max(1, h / 540)               // ~2 px at 1080p
+        let x0 = w / 10, x1 = w - w / 10            // skip the corner HUD
+        let searchRows = Int(Double(h) * 0.34)      // never look above the bottom third
+        let lineGap = Int(Double(h) * 0.05)         // max gap between stacked caption lines
+        var reach = Int(Double(h) * 0.13)           // rows up from the bottom edge
+        var found = false
+        var minX = w, maxX = 0
+        var up = 0
+        while up < searchRows {
+            let row = luma + (h - 1 - up) * rowBytes
+            var edges = 0, rowMin = w, rowMax = 0
+            var x = x0
+            while x + step < x1 {
+                let a = Int(row[x]), b = Int(row[x + step])
+                if max(a, b) > 175 && abs(a - b) > 70 {
+                    edges += 1
+                    if x < rowMin { rowMin = x }
+                    if x > rowMax { rowMax = x }
+                }
+                x += step
+            }
+            if edges >= 8 && up <= reach + lineGap {   // a text row touching the strip or the line below it
+                reach = max(reach, up)
+                found = true
+                minX = min(minX, rowMin)
+                maxX = max(maxX, rowMax)
+            }
+            up += rowStep
+        }
+        guard found else { return nil }
+        let margin = 0.035                          // room for the soft edge so the whole line stays sharp-free
+        return (CGFloat(min(0.34, Double(reach) / Double(h) + margin)),
+                CGFloat(max(0.02, Double(minX) / Double(w) - 0.03)),
+                CGFloat(min(0.98, Double(maxX + step) / Double(w) + 0.03)))
+    }
+
+    /// Auto mode: grow the strip at once when a caption needs more room, shrink it back ~1.5 s later.
+    private func updateBand(for frame: CVPixelBuffer) {
+        guard subtitleMode == .auto else { return }
+        detectCounter += 1
+        guard detectCounter % 2 == 0 else { return }          // every other game frame is plenty
+        var target = (top: CGFloat(0.13), left: CGFloat(0.2), right: CGFloat(0.8))
+        if let c = findCaptions(in: frame) {
+            target = (max(target.top, c.top), min(target.left, c.left), max(target.right, c.right))
+        }
+        // Round to steps so the mask is reused instead of redrawn for tiny changes.
+        target = ((target.top * 100).rounded(.up) / 100, (target.left * 50).rounded(.down) / 50,
+                  (target.right * 50).rounded(.up) / 50)
+        if target.top > band.top || target.left < band.left || target.right > band.right {
+            band = (max(band.top, target.top), min(band.left, target.left), max(band.right, target.right))
+            bandHold = 24                                    // ≈ 1.5 s of game frames (checked every other)
+        } else if bandHold > 0 {
+            bandHold -= 1
+        } else {
+            band = target
+        }
+    }
+
+    /// White = protected (keep the original), black = enhance. Soft edges; one mask per strip size, reused.
     private func hudMask() -> CIImage? {
-        if maskBuffer == nil {
+        let key = "\(Int((band.top * 100).rounded()))-\(Int((band.left * 50).rounded()))-\(Int((band.right * 50).rounded()))"
+        if masks[key] == nil {
+            if masks.count > 40 { masks.removeAll() }
             let attributes: [String: Any] = [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
                 kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -563,9 +653,9 @@ final class Enhancer {
             }
             mask = mask.clampedToExtent().applyingGaussianBlur(sigma: 10).cropped(to: extent)
             context.render(mask, to: buffer, bounds: extent, colorSpace: nil)
-            maskBuffer = buffer
+            masks[key] = buffer
         }
-        guard let maskBuffer else { return nil }
+        guard let maskBuffer = masks[key] else { return nil }
         return CIImage(cvPixelBuffer: maskBuffer, options: [.colorSpace: NSNull()])
     }
 
@@ -606,6 +696,7 @@ final class Enhancer {
             kCIInputBrightnessKey: 0.0,
         ])
         image = image.cropped(to: original.extent)
+        if protectHUD { updateBand(for: frame) }
         if protectHUD, let mask = hudMask() {
             // Soft-edged blend so there are no visible boxes where protection starts.
             image = original.applyingFilter("CIBlendWithMask", parameters: [
@@ -1243,6 +1334,11 @@ final class VideoView: NSView {
     private let beforeMask = CALayer()
     private let divider = CALayer()
     private let handle = CALayer()
+    /// Dashed outlines of the areas enhancement leaves alone (HUD corners + subtitle strip).
+    private let protectedLayer = CAShapeLayer()
+    var showsProtected = false { didSet { protectedLayer.isHidden = !showsProtected; needsLayout = true } }
+    var protectedRects: [CGRect] = [] { didSet { if showsProtected { needsLayout = true } } }
+    var contentSize = CGSize(width: 16, height: 9) { didSet { if showsProtected { needsLayout = true } } }
     let beforeTag = NSTextField(labelWithString: "BEFORE")
     let afterTag = NSTextField(labelWithString: "AFTER")
     /// 0…1 — where the divider sits. Drag it with the mouse.
@@ -1280,6 +1376,12 @@ final class VideoView: NSView {
         handle.borderColor = NSColor.white.cgColor
         handle.borderWidth = 2
         handle.cornerRadius = 14
+        protectedLayer.fillColor = NSColor(srgbRed: 0.91, green: 0.11, blue: 0.16, alpha: 0.10).cgColor
+        protectedLayer.strokeColor = NSColor(srgbRed: 1, green: 0.25, blue: 0.3, alpha: 0.95).cgColor
+        protectedLayer.lineWidth = 2
+        protectedLayer.lineDashPattern = [6, 4]
+        protectedLayer.isHidden = true
+        layer?.addSublayer(protectedLayer)
         layer?.addSublayer(divider)
         layer?.addSublayer(handle)
         for (tag, colour) in [(beforeTag, NSColor(white: 0.08, alpha: 0.85)),
@@ -1306,6 +1408,19 @@ final class VideoView: NSView {
         beforeMask.frame = CGRect(x: 0, y: 0, width: x, height: bounds.height)
         divider.frame = CGRect(x: x - 1, y: 0, width: 2, height: bounds.height)
         handle.frame = CGRect(x: x - 14, y: bounds.midY - 14, width: 28, height: 28)
+        protectedLayer.frame = bounds
+        if showsProtected {
+            // Same aspect-fit rectangle the video is drawn in.
+            let scale = min(bounds.width / contentSize.width, bounds.height / contentSize.height)
+            let vw = contentSize.width * scale, vh = contentSize.height * scale
+            let video = CGRect(x: (bounds.width - vw) / 2, y: (bounds.height - vh) / 2, width: vw, height: vh)
+            let path = CGMutablePath()
+            for r in protectedRects {
+                path.addRect(CGRect(x: video.minX + r.minX * vw, y: video.minY + r.minY * vh,
+                                    width: r.width * vw, height: r.height * vh).insetBy(dx: 1, dy: 1))
+            }
+            protectedLayer.path = path
+        }
         CATransaction.commit()
         for tag in [beforeTag, afterTag] { tag.sizeToFit() }
         let pad: CGFloat = 10
@@ -1385,6 +1500,8 @@ struct LiveStats: Sendable {
     var audio = ""
     var inputWidth = 0, inputHeight = 0
     var processWidth = 0, processHeight = 0          // smaller than input for 4K / 1440p capture cards
+    var protectedRects: [CGRect] = []                // fractions of the frame, origin bottom-left
+    var subtitleStrip = 0                            // % of frame height protected for subtitles
     var outputWidth = 0, outputHeight = 0
     var inputFPS = 0.0, gameFPS = 0.0, outputFPS = 0.0
     var onePercentLow: Double?
@@ -1439,6 +1556,7 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
     private var enhanceBacklog = 0                    // counterLock
     private var enhanceLevel = EnhanceLevel.off       // enhanceQueue only
     private var protectHUD = true                     // enhanceQueue only
+    private var subtitleMode = SubtitleMode.auto      // enhanceQueue only
     private var enhancer: Enhancer?                   // enhanceQueue only
     private var enhanceDenoiseFellBack = false        // enhanceQueue only
     private var enhanceSecondsBehind = 0              // processingQueue only
@@ -1451,6 +1569,8 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         var fellBack = false
         var denoiseFailed: String?
         var lastError: String?
+        var protectedRects: [CGRect] = []
+        var subtitleTop: CGFloat = 0
     }
     private var enhanceStats = EnhanceStats()         // counterLock
     private var upscaler: Upscaler?
@@ -1594,10 +1714,11 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         }
     }
 
-    func setEnhancement(_ level: EnhanceLevel, protectHUD: Bool) {
+    func setEnhancement(_ level: EnhanceLevel, protectHUD: Bool, subtitles: SubtitleMode = .auto) {
         enhanceQueue.async {
             self.enhanceLevel = level
             self.protectHUD = protectHUD
+            self.subtitleMode = subtitles
             self.enhancer = nil
             self.enhanceDenoiseFellBack = false
             self.counterLock.lock()
@@ -1622,7 +1743,8 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         let w = CVPixelBufferGetWidth(frame), h = CVPixelBufferGetHeight(frame)
         let format = CVPixelBufferGetPixelFormatType(frame)
         if enhancer == nil || enhancer!.width != w || enhancer!.height != h || enhancer!.format != format {
-            enhancer = Enhancer(width: w, height: h, format: format, level: enhanceLevel, protectHUD: protectHUD)
+            enhancer = Enhancer(width: w, height: h, format: format, level: enhanceLevel, protectHUD: protectHUD,
+                                subtitleMode: subtitleMode)
             enhancer?.denoiseAllowed = !enhanceDenoiseFellBack
         }
         guard let enhancer else { return frame }
@@ -1637,6 +1759,8 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
         enhanceStats.denoising = enhancer.denoiseActive
         enhanceStats.denoiseFailed = enhancer.denoiseFailed
         enhanceStats.lastError = enhancer.lastError
+        enhanceStats.protectedRects = protectHUD ? enhancer.protectedRects : []
+        enhanceStats.subtitleTop = protectHUD ? enhancer.band.top : 0
         counterLock.unlock()
         enhancer.resetTimings()
         return result
@@ -2190,6 +2314,8 @@ final class CaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDel
             if es.denoiseCount > 0 { live.cleanUpMs = es.denoiseMs / Double(es.denoiseCount) }
             if es.pictureCount > 0 { live.pictureMs = es.pictureMs / Double(es.pictureCount) }
             if es.fellBack && es.level.denoiseStrength > 0 { live.enhancement += " · clean-up off" }
+            live.protectedRects = es.protectedRects
+            live.subtitleStrip = Int((es.subtitleTop * 100).rounded())
         }
 
         let simple = String(format: "Output: %.0f fps  ·  Latency: %.0f ms", outFps, clock.delayMs)
@@ -2724,6 +2850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private let rangePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private var frameGenSwitch: ToggleSwitch!
     private var hudSwitch: ToggleSwitch!
+    private let subtitlePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var protectedSwitch: ToggleSwitch!
     private var overlaySwitch: ToggleSwitch!
     private var detailedSwitch: ToggleSwitch!
     private let sourceHint = Theme.wrapping("", 11.5, width: 320)
@@ -2764,6 +2892,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var savedUpscale: Int { defaults.integer(forKey: "upscaleTag") }
     private var savedEnhance: EnhanceLevel { EnhanceLevel(rawValue: defaults.integer(forKey: "enhanceLevel")) ?? .off }
     private var savedHUD: Bool { defaults.object(forKey: "protectHUD") as? Bool ?? true }
+    private var savedSubtitles: SubtitleMode { SubtitleMode(rawValue: defaults.integer(forKey: "subtitleMode")) ?? .auto }
+    private var showProtected: Bool { defaults.bool(forKey: "showProtected") }
     private var savedRange: ColourRange { ColourRange(rawValue: defaults.integer(forKey: "colourRange")) ?? .auto }
     private var showOverlay: Bool { defaults.bool(forKey: "showOverlay") }
     private var detailedOverlay: Bool { defaults.bool(forKey: "detailedStats") }
@@ -3144,6 +3274,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         rangePopup.target = self; rangePopup.action = #selector(rangeChanged)
         frameGenSwitch = ToggleSwitch(on: frameGenOn, label: "Frame generation")
         frameGenSwitch.onChange = { [weak self] on in self?.setFrameGeneration(on) }
+        for mode in [SubtitleMode.auto, .normal, .large, .largest] {
+            subtitlePopup.addItem(withTitle: mode.title)
+            subtitlePopup.lastItem?.tag = mode.rawValue
+        }
+        subtitlePopup.target = self; subtitlePopup.action = #selector(subtitleModeChanged)
+        protectedSwitch = ToggleSwitch(on: showProtected, label: "Show protected areas")
+        protectedSwitch.onChange = { [weak self] on in
+            self?.defaults.set(on, forKey: "showProtected")
+            self?.syncControls()
+        }
         hudSwitch = ToggleSwitch(on: savedHUD, label: "Protect HUD and subtitles")
         hudSwitch.onChange = { [weak self] on in
             self?.defaults.set(on, forKey: "protectHUD")
@@ -3214,6 +3354,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 row("Upscaling", "MetalFX, Apple's game upscaler. 60 fps only. Turns itself off if the Mac can't keep up.", upscalePopup),
                 row("Enhancement", "Light: sharpen + colour. Medium / Strong: also clean up capture noise and shimmer. ⌥⌘0–3", enhancePopup),
                 row("Protect HUD & subtitles", "Leaves the corners and the subtitle area untouched so text and minimaps stay crisp.", hudSwitch),
+                row("Subtitle area", "Auto finds the captions on screen and grows the protected strip to fit two-line and large captions. Or pick a fixed height.", subtitlePopup),
+                row("Show protected areas", "Draws dashed outlines over the video where enhancement is held back (not in recordings or the stream).", protectedSwitch),
                 hintRow(qualityHint),
             ]),
             ("Audio", [
@@ -3497,7 +3639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             String(format: "%@ · %.0f fps", res(live.outputWidth, live.outputHeight), live.outputFPS),
             live.frameGeneration,
             live.upscaling,
-            live.enhancement,
+            live.enhancement + (live.subtitleStrip > 0 ? " · subtitles \(live.subtitleStrip)%" : ""),
             "\(live.screenHz) Hz",
         ]
         for (label, value) in zip(signalValues, values) { label.stringValue = value }
@@ -3517,6 +3659,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
 
         updateCompareTags(live)
+        videoView.protectedRects = live.protectedRects
+        videoView.contentSize = CGSize(width: max(1, live.outputWidth), height: max(1, live.outputHeight))
         updateAudioHint(live)
         fpsBig.stringValue = String(format: "%.1f", live.outputFPS)
         let low = live.onePercentLow.map { String(format: "1%% low %.0f", $0) } ?? "1% low –"
@@ -3587,6 +3731,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         frameGenSwitch.isOn = frameGenOn
         hudSwitch.isOn = savedHUD
         hudSwitch.isEnabled = savedEnhance != .off
+        subtitlePopup.selectItem(withTag: savedSubtitles.rawValue)
+        subtitlePopup.isEnabled = savedEnhance != .off && savedHUD
+        protectedSwitch.isOn = showProtected
+        protectedSwitch.isEnabled = savedEnhance != .off && savedHUD
+        videoView.showsProtected = showProtected && savedEnhance != .off && savedHUD
         overlaySwitch.isOn = showOverlay
         detailedSwitch.isOn = detailedOverlay
         statsBox.isHidden = !showOverlay
@@ -3635,7 +3784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     private func applyEnhancement() {
-        capture.setEnhancement(savedEnhance, protectHUD: savedHUD)
+        capture.setEnhancement(savedEnhance, protectHUD: savedHUD, subtitles: savedSubtitles)
         syncControls()
     }
 
@@ -3686,6 +3835,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         syncControls()
     }
 
+    @objc private func subtitleModeChanged() {
+        defaults.set(subtitlePopup.selectedTag(), forKey: "subtitleMode")
+        applyEnhancement()
+    }
+
     @objc private func enhanceChanged() {
         defaults.set(enhancePopup.selectedTag(), forKey: "enhanceLevel")
         applyEnhancement()
@@ -3697,7 +3851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc private func resetSettings() {
-        for key in ["targetFPS", "frameGeneration", "upscaleTag", "enhanceLevel", "protectHUD", "colourRange",
+        for key in ["targetFPS", "frameGeneration", "upscaleTag", "enhanceLevel", "protectHUD", "subtitleMode", "showProtected", "colourRange",
                     "showOverlay", "detailedStats", "recordingsFolder", "screenshotsFolder",
                     "soundOn", "soundVolume", "audioSyncMs", "audioOutputUID"] {
             defaults.removeObject(forKey: key)
@@ -3710,7 +3864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             capture.setTargetFPS(currentFPS)
             capture.setFrameGeneration(frameGenOn)
             applyUpscaling()
-            capture.setEnhancement(savedEnhance, protectHUD: savedHUD)
+            capture.setEnhancement(savedEnhance, protectHUD: savedHUD, subtitles: savedSubtitles)
             capture.setColourRange(savedRange)
         }
         syncControls()
@@ -3809,7 +3963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         capture.setTargetFPS(currentFPS)
         capture.setColourRange(savedRange)
         applyUpscaling()
-        capture.setEnhancement(savedEnhance, protectHUD: savedHUD)
+        capture.setEnhancement(savedEnhance, protectHUD: savedHUD, subtitles: savedSubtitles)
         capture.setFrameGeneration(frameGenOn)
         applyAudio()
         running = true
