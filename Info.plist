@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.tanmay.smooth60</string>
+    <key>CFBundleName</key>
+    <string>Smooth60</string>
+    <key>CFBundleDisplayName</key>
+    <string>Smooth60</string>
+    <key>CFBundleExecutable</key>
+    <string>Smooth60</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.4</string>
+    <key>CFBundleVersion</key>
+    <string>4</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Smooth60 shows the video from your capture card.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Smooth60 plays the game audio from your capture card.</string>
+</dict>
+</plist>
